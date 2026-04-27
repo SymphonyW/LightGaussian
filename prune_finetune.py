@@ -63,15 +63,31 @@ def training(
     debug_from,
     args,
 ):
+    """
+    加载已有 Gaussian 模型，执行一次或多次剪枝，然后继续 fine-tune 恢复质量。
+
+    和 train_densify_prune.py 的区别：
+        train_densify_prune.py: 从输入点云开始训练，并在训练中插入剪枝；
+        prune_finetune.py: 从 checkpoint 或 point_cloud.ply 开始，面向已训练模型做压缩。
+
+    典型用法是：
+        1. 先用原版/本项目训练得到一个高质量 point_cloud.ply；
+        2. 用 --start_pointcloud 或 --start_checkpoint 加载；
+        3. 在 args.prune_iterations 指定的位置剪掉低分 Gaussian；
+        4. 后续迭代继续优化剩余 Gaussian，恢复 PSNR/SSIM/LPIPS。
+    """
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
     if checkpoint:
+        # checkpoint 路径会恢复 optimizer 状态，适合从中断训练继续。
         gaussians.training_setup(opt)
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
     elif args.start_pointcloud:
+        # point_cloud.ply 只保存 Gaussian 参数，不保存 optimizer 状态；
+        # 因此 load_ply 后必须重新 training_setup()。
         gaussians.load_ply(args.start_pointcloud)
         ic(gaussians.get_xyz.shape)
         # ic(gaussians.optimizer.param_groups["xyz"].shape)
@@ -97,6 +113,7 @@ def training(
     gaussians.scheduler = ExponentialLR(gaussians.optimizer, gamma=0.95)
 
     for iteration in range(first_iter, opt.iterations + 1):
+        # 可选 GUI 预览逻辑，和原版 3DGS 训练脚本保持一致。
         if network_gui.conn == None:
             network_gui.try_connect()
         while network_gui.conn != None:
@@ -135,17 +152,21 @@ def training(
         gaussians.update_learning_rate(iteration)
 
         # Every 1000 its we increase the levels of SH up to a maximum degree
+        # fine-tune 阶段仍保持 SH 逐步升阶策略；如果加载的模型已经是满阶，
+        # oneupSHdegree() 不会超过 max_sh_degree。
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
         if iteration % 400 == 0:
             gaussians.scheduler.step()
 
         # Pick a random Camera
+        # 随机取一个训练视角做常规 photometric fine-tune。
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
 
         # Render
+        # 剪枝后剩余 Gaussian 的几何/颜色都需要重新适配，所以这里仍用真实图像监督。
         if (iteration - 1) == debug_from:
             pipe.debug = True
         render_pkg = render(viewpoint_cam, gaussians, pipe, background)
@@ -213,28 +234,36 @@ def training(
             if iteration in args.prune_iterations:
                 ic("Before prune iteration, number of gaussians: " + str(len(gaussians.get_xyz)))
                 i = args.prune_iterations.index(iteration)
+                # 剪枝前先完整遍历训练视角，得到当前模型的全局统计。
+                # 这些分数会随 fine-tune 变化，因此每个 prune iteration 都重新统计。
                 gaussian_list, imp_list = prune_list(gaussians, scene, pipe, background)
 
                 if args.prune_type == "important_score":
+                    # 直接按 rasterizer 统计的像素贡献剪枝。
                     gaussians.prune_gaussians(
                         (args.prune_decay**i) * args.prune_percent, imp_list
                     )
                 elif args.prune_type == "v_important_score":
                     # normalize scale
+                    # LightGaussian 默认更推荐的分数：像素贡献 * 体积修正。
+                    # 它比纯 important_score 更能保留覆盖大空间结构的 Gaussian。
                     v_list = calculate_v_imp_score(gaussians, imp_list, args.v_pow)
                     gaussians.prune_gaussians(
                         (args.prune_decay**i) * args.prune_percent, v_list
                     )
                 elif args.prune_type == "max_v_important_score":
+                    # 用最大轴尺度做几何权重，和体积权重相比更偏向保留长条/扁平结构。
                     v_list = imp_list * torch.max(gaussians.get_scaling, dim=1)[0]
                     gaussians.prune_gaussians(
                         (args.prune_decay**i) * args.prune_percent, v_list
                     )
                 elif args.prune_type == "count":
+                    # 只按可见/参与次数剪枝。这个分数更粗糙，不直接衡量颜色贡献。
                     gaussians.prune_gaussians(
                         (args.prune_decay**i) * args.prune_percent, gaussian_list
                     )
                 elif args.prune_type == "opacity":
+                    # 只按 opacity 剪枝，适合作为 baseline，但可能误删低 alpha 细节。
                     gaussians.prune_gaussians(
                         (args.prune_decay**i) * args.prune_percent,
                         gaussians.get_opacity.detach(),
@@ -272,6 +301,8 @@ def training(
                 ic("After prune iteration, number of gaussians: " + str(len(gaussians.get_xyz)))
 
             # if iteration in args.densify_iteration:
+            # 下面这段保留了“剪枝后再 densify”的实验入口，默认关闭。
+            # 开启后会重新增加 Gaussian，压缩率会下降，但有时能恢复被误剪的细节。
             #     gaussians.max_radii2D[visibility_filter] = torch.max(
             #         gaussians.max_radii2D[visibility_filter], radii[visibility_filter]
             #     )

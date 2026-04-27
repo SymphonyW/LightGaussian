@@ -32,6 +32,8 @@ from scene.gaussian_model import BasicPointCloud
 
 
 class CameraInfo(NamedTuple):
+    # 轻量级相机描述，仍停留在 CPU/PIL/numpy 层。
+    # 后续 utils.camera_utils.loadCam() 会把它转换成真正训练用的 Camera。
     uid: int
     R: np.array
     T: np.array
@@ -45,6 +47,7 @@ class CameraInfo(NamedTuple):
 
 
 class SceneInfo(NamedTuple):
+    # Scene 只依赖这个统一结构，不直接关心数据来自 COLMAP 还是 Blender。
     point_cloud: BasicPointCloud
     train_cameras: list
     test_cameras: list
@@ -53,6 +56,12 @@ class SceneInfo(NamedTuple):
 
 
 def getNerfppNorm(cam_info):
+    """
+    计算 NeRF++/3DGS 风格的场景归一化参数。
+
+    translate 会把相机中心整体移到原点附近；radius 表示训练相机分布的尺度。
+    LightGaussian/3DGS 后续用 radius 影响 position learning rate 和 densify 阈值。
+    """
     def get_center_and_diag(cam_centers):
         cam_centers = np.hstack(cam_centers)
         avg_cam_center = np.mean(cam_centers, axis=1, keepdims=True)
@@ -77,6 +86,13 @@ def getNerfppNorm(cam_info):
 
 
 def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
+    """
+    把 COLMAP 的 intrinsics/extrinsics 转成 CameraInfo 列表。
+
+    COLMAP 中 images.bin/images.txt 保存外参，cameras.bin/cameras.txt 保存内参。
+    这里支持 PINHOLE 和 SIMPLE_PINHOLE 两类已去畸变相机模型；如果数据仍有畸变，
+    需要先用 COLMAP image_undistorter 处理。
+    """
     cam_infos = []
     for idx, key in enumerate(cam_extrinsics):
         sys.stdout.write("\r")
@@ -90,6 +106,8 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         width = intr.width
 
         uid = intr.id
+        # qvec2rotmat(extr.qvec) 得到 COLMAP world-to-camera 旋转；这里转置是为了匹配
+        # 后续 getWorld2View2 和 CUDA glm 侧使用的矩阵布局。
         R = np.transpose(qvec2rotmat(extr.qvec))
         T = np.array(extr.tvec)
 
@@ -129,6 +147,8 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
 
 
 def fetchPly(path):
+    # 读取已有 points3D.ply，返回 BasicPointCloud。这个点云只用于初始化 Gaussian，
+    # 后续训练保存的 point_cloud.ply 会包含更多 Gaussian 属性。
     plydata = PlyData.read(path)
     vertices = plydata["vertex"]
     positions = np.vstack([vertices["x"], vertices["y"], vertices["z"]]).T
@@ -138,6 +158,8 @@ def fetchPly(path):
 
 
 def storePly(path, xyz, rgb):
+    # 把 COLMAP points3D.bin/txt 或 synthetic 随机点云转成统一的 PLY。
+    # normal 初始化为 0，因为 3DGS 初始化阶段并不使用法线。
     # Define the dtype for the structured array
     dtype = [
         ("x", "f4"),
@@ -164,6 +186,19 @@ def storePly(path, xyz, rgb):
 
 
 def readColmapSceneInfo(path, images, eval, llffhold=8):
+    """
+    读取 COLMAP 数据集并返回 SceneInfo。
+
+    典型目录结构：
+        source_path/
+          images/
+          sparse/0/cameras.bin
+          sparse/0/images.bin
+          sparse/0/points3D.bin
+
+    如果 binary 文件读取失败，会退回读取 txt 文件。
+    eval=True 时按 llffhold 抽取测试集；默认每 8 张取 1 张 test。
+    """
     try:
         cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
@@ -184,6 +219,7 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
     cam_infos = sorted(cam_infos_unsorted.copy(), key=lambda x: x.image_name)
 
     if eval:
+        # LLFF/MipNeRF360 常用划分：每 llffhold 张图中拿一张做测试。
         train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
         test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold == 0]
     else:
@@ -196,6 +232,7 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
     bin_path = os.path.join(path, "sparse/0/points3D.bin")
     txt_path = os.path.join(path, "sparse/0/points3D.txt")
     if not os.path.exists(ply_path):
+        # 第一次打开数据集时把 COLMAP 点云转成 PLY，后续 create_from_pcd 直接读取 PLY。
         print(
             "Converting point3d.bin to .ply, will happen only the first time you open the scene."
         )
@@ -220,6 +257,12 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
 
 
 def readCamerasFromTransforms(path, transformsfile, white_background, extension=".png"):
+    """
+    读取 Blender/NeRF synthetic 的 transforms_*.json。
+
+    NeRF JSON 中 transform_matrix 是 camera-to-world，并使用 OpenGL/Blender 轴约定；
+    训练代码和 COLMAP 分支使用 COLMAP 轴约定，所以这里会翻转 Y/Z 轴并求逆得到 W2C。
+    """
     cam_infos = []
 
     with open(os.path.join(path, transformsfile)) as json_file:
@@ -250,6 +293,8 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
 
             bg = np.array([1, 1, 1]) if white_background else np.array([0, 0, 0])
 
+            # Blender 数据常带 alpha。这里先按白/黑背景合成成 RGB，保证训练目标
+            # 和 dataset.white_background 配置一致。
             norm_data = im_data / 255.0
             arr = norm_data[:, :, :3] * norm_data[:, :, 3:4] + bg * (
                 1 - norm_data[:, :, 3:4]
@@ -279,6 +324,12 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
 
 
 def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
+    """
+    读取 Blender synthetic 场景。
+
+    Blender 数据没有 COLMAP sparse point cloud，所以第一次运行时会在固定范围内
+    生成 100k 个随机点作为 Gaussian 初始化。后续会复用 points3d.ply。
+    """
     print("Reading Training Transforms")
     train_cam_infos = readCamerasFromTransforms(
         path, "transforms_train.json", white_background, extension

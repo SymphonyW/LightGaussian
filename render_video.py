@@ -91,6 +91,8 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 
 # xy circular 
 def render_circular_video(model_path, iteration, views, gaussians, pipeline, background, radius=0.5, n_frames=240): 
+    # 围绕固定测试视角生成圆形相机轨迹。每一帧都会 deepcopy 一个基准 Camera，
+    # 然后修改它的位姿矩阵再调用同一个 render()。
     render_path = os.path.join(model_path, 'circular', "ours_{}".format(iteration))
     os.makedirs(render_path, exist_ok=True)
     makedirs(render_path, exist_ok=True)
@@ -105,12 +107,20 @@ def render_circular_video(model_path, iteration, views, gaussians, pipeline, bac
 
 
 def render_video(model_path, iteration, views, gaussians, pipeline, background):
+    """
+    沿 generate_ellipse_path() 生成的轨迹渲染视频帧。
+
+    如果想换轨迹，核心就是替换 for 循环里的 generate_ellipse_path 为
+    utils.pose_utils 中的 generate_spiral_path / generate_spherify_path 等函数。
+    """
     render_path = os.path.join(model_path, 'video', "ours_{}".format(iteration))
     makedirs(render_path, exist_ok=True)
     view = views[0]
     # render_path_spiral
     # render_path_spherical
     for idx, pose in enumerate(tqdm(generate_ellipse_path(views,n_frames=600), desc="Rendering progress")):
+        # pose 是 camera-to-world 风格的轨迹位姿。这里转换为 Camera 需要的
+        # world_view_transform，并同步更新 full_proj_transform 和 camera_center。
         view.world_view_transform = torch.tensor(getWorld2View2(pose[:3, :3].T, pose[:3, 3], view.trans, view.scale)).transpose(0, 1).cuda()
         view.full_proj_transform = (view.world_view_transform.unsqueeze(0).bmm(view.projection_matrix.unsqueeze(0))).squeeze(0)
         view.camera_center = view.world_view_transform.inverse()[3, :3]
@@ -121,6 +131,7 @@ def render_video(model_path, iteration, views, gaussians, pipeline, background):
 
 
 def gaussian_render(model_path, iteration, views, gaussians, pipeline, background, args):
+    # 对少量测试视角做随机位姿扰动并渲染，用于检查模型在邻近虚拟视角下是否稳定。
     views = views[:10] #take the first 10 views and check gaussian view point 
     render_path = os.path.join(model_path, 'video', "gaussians_{}_std{}".format(iteration, args.std))
     makedirs(render_path, exist_ok=True)
@@ -138,6 +149,7 @@ def gaussian_render(model_path, iteration, views, gaussians, pipeline, backgroun
 
 
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, video: bool, circular:bool, radius: float, args):
+    # 统一加载模型并按命令行开关决定渲染 train/test、椭圆视频、圆形视频或虚拟扰动视角。
     with torch.no_grad():
         gaussians = GaussianModel(dataset.sh_degree)
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False, load_vq= args.load_vq)

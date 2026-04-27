@@ -59,11 +59,25 @@ img2mse = lambda x, y: torch.mean((x - y)**2)
 mse2psnr = lambda x: -10. * torch.log(x) / torch.log(to_tensor([10.]))
 
 def training(args, dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, new_max_sh):
+    """
+    SH distillation：用高阶 SH 的 teacher 渲染结果监督低阶 SH 的 student。
+
+    目标不是让 student 直接拟合真实图片，而是拟合 teacher 在同一视角下的渲染：
+        teacher Gaussian: 原始高阶 SH，质量高但属性多；
+        student Gaussian: 较低 SH 阶数，属性更少；
+        loss(student_render, teacher_render) -> 优化 student。
+
+    这样可以把外观表示压小，同时尽量保留 teacher 的视觉效果。后续 VecTree/VQ
+    通常会继续压缩 student 的 SH 特征。
+    """
     first_iter = 0
     old_sh_degree = dataset.sh_degree
+    # Scene 初始化时会根据 dataset.sh_degree 创建/加载 student。
+    # 这里先把 dataset.sh_degree 改成 new_max_sh，表示 student 最终只保留低阶 SH。
     dataset.sh_degree = new_max_sh
     tb_writer = prepare_output_and_logger(dataset)    
     with torch.no_grad():
+        # teacher 只用于前向渲染，不需要梯度；后面会把 optimizer 置空。
         teacher_gaussians = GaussianModel(old_sh_degree) 
         # teacher_gaussians.training_setup(opt)
 
@@ -71,6 +85,8 @@ def training(args, dataset, opt, pipe, testing_iterations, saving_iterations, ch
     student_scene = Scene(dataset, student_gaussians)
 
     if checkpoint:
+        # teacher_model 是完整高阶模型；checkpoint 是 student 的起点。
+        # student 先 restore，再把 max_sh_degree 改低并裁剪 features_rest。
         (teacher_model_params, _) = torch.load(args.teacher_model)
         (model_params, first_iter) = torch.load(checkpoint)
         teacher_gaussians.restore(teacher_model_params, copy.deepcopy(opt))
@@ -80,6 +96,8 @@ def training(args, dataset, opt, pipe, testing_iterations, saving_iterations, ch
     student_gaussians.training_setup(opt)
     student_gaussians.scheduler = ExponentialLR(student_gaussians.optimizer, gamma=0.90)
     # if !args.enable
+    # 默认只蒸馏 SH/颜色；如果不显式打开，几何尺度、旋转和 opacity 会被冻结。
+    # 这样压缩阶段不会破坏已经训练好的几何结构，风险更低。
     if (not args.enable_covariance):
         student_gaussians._scaling.requires_grad = False
         student_gaussians._rotation.requires_grad = False
@@ -98,6 +116,7 @@ def training(args, dataset, opt, pipe, testing_iterations, saving_iterations, ch
 
     # os.makedirs(student_scene.model_path + "/vis_data", exist_ok=True)
     for iteration in range(first_iter, opt.iterations + 1):        
+        # 与训练脚本相同的 GUI 预览逻辑，不过预览的是 student 当前渲染。
         if network_gui.conn == None:
             network_gui.try_connect()
         while network_gui.conn != None:
@@ -121,6 +140,8 @@ def training(args, dataset, opt, pipe, testing_iterations, saving_iterations, ch
             # student_gaussians.oneupSHdegree()
             student_gaussians.scheduler.step()
 
+        # 取原始训练相机后 deepcopy，一方面避免 augmented_view 改写原相机对象，
+        # 另一方面保证 teacher/student 在同一个扰动视角上渲染。
         if not viewpoint_stack:
             viewpoint_stack = student_scene.getTrainCameras().copy()
         viewpoint_cam_org = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
@@ -130,6 +151,8 @@ def training(args, dataset, opt, pipe, testing_iterations, saving_iterations, ch
             pipe.debug = True
 
         if args.augmented_view and iteration%3:
+            # 可选的虚拟视角增强：对训练相机做小幅位姿扰动，然后用 teacher 渲染
+            # 出该视角的软标签。这样 student 不只记忆原始训练视角。
             viewpoint_cam = gaussian_poses(viewpoint_cam, mean= 0, std_dev_translation=0.05, std_dev_rotation=0)
             student_render_pkg = render(viewpoint_cam, student_gaussians, pipe, background)
             student_image = student_render_pkg["render"]
@@ -139,9 +162,11 @@ def training(args, dataset, opt, pipe, testing_iterations, saving_iterations, ch
             render_pkg = render(viewpoint_cam, student_gaussians, pipe, background)
             student_image = render_pkg["render"]
             teacher_image = render(viewpoint_cam, teacher_gaussians, pipe, background)["render"].detach() 
+        # teacher_image detach 后作为固定目标；反向传播只更新 student。
         Ll1 = l1_loss(student_image, teacher_image)
         # Ll1 = img2mse(student_image, teacher_image)
 
+        # 仍使用 L1 + DSSIM 的图像级损失，但目标图像来自 teacher，而不是真实照片。
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(student_image, teacher_image))
         loss.backward()
         iter_end.record()
@@ -172,6 +197,8 @@ def training(args, dataset, opt, pipe, testing_iterations, saving_iterations, ch
                 torch.save((student_gaussians.capture(), iteration), student_scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
                 if iteration == checkpoint_iterations[-1]:
+                    # distill 后保存新的重要性分数，供 VecTree 量化阶段决定哪些 Gaussian
+                    # 的 SH 特征保持原值、哪些进入 codebook。
                     print("Saving Imp_score")
                     gaussian_list, imp_list = prune_list(
                         student_gaussians, student_scene, pipe, background

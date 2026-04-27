@@ -20,6 +20,10 @@ class GroupParams:
 
 class ParamGroup:
     def __init__(self, parser: ArgumentParser, name: str, fill_none=False):
+        # 这个类把子类中预先定义的成员变量自动注册成 argparse 参数。
+        # 例如 ModelParams.__init__ 中的 self._source_path 会变成：
+        #   --source_path 和短参数 -s
+        # 下划线前缀表示自动生成一个首字母短参数。
         group = parser.add_argument_group(name)
         for key, value in vars(self).items():
             shorthand = False
@@ -44,6 +48,9 @@ class ParamGroup:
                     group.add_argument("--" + key, default=value, type=t)
 
     def extract(self, args):
+        # 从总的 argparse Namespace 中提取属于当前参数组的字段，返回一个轻量对象。
+        # 训练代码里 lp.extract(args)、op.extract(args)、pp.extract(args) 就是靠这里
+        # 把加载参数、优化参数和渲染管线参数分开。
         group = GroupParams()
         for arg in vars(args).items():
             if arg[0] in vars(self) or ("_" + arg[0]) in vars(self):
@@ -53,6 +60,7 @@ class ParamGroup:
 
 class ModelParams(ParamGroup):
     def __init__(self, parser, sentinel=False):
+        # 这些参数描述数据和模型路径，以及输入图像如何加载。
         self.sh_degree = 3
         self._source_path = ""
         self._model_path = ""
@@ -71,6 +79,8 @@ class ModelParams(ParamGroup):
 
 class PipelineParams(ParamGroup):
     def __init__(self, parser):
+        # 控制部分计算在 Python 侧还是 CUDA rasterizer 侧完成。
+        # 默认 False 表示尽量走 CUDA，通常更快。
         self.convert_SHs_python = False
         self.compute_cov3D_python = False
         self.debug = False
@@ -79,6 +89,8 @@ class PipelineParams(ParamGroup):
 
 class OptimizationParams(ParamGroup):
     def __init__(self, parser):
+        # 原版 3DGS 的主要优化超参数。LightGaussian 的剪枝/蒸馏脚本会复用这些参数，
+        # 并额外添加 prune_iterations、prune_percent、new_max_sh 等自己的参数。
         self.iterations = 30_000
         self.position_lr_init = 0.00016
         self.position_lr_final = 0.0000016
@@ -99,6 +111,13 @@ class OptimizationParams(ParamGroup):
 
 
 def get_combined_args(parser: ArgumentParser):
+    """
+    合并命令行参数和 model_path/cfg_args。
+
+    训练时 prepare_output_and_logger 会把参数保存成 cfg_args；渲染/评估时如果只传
+    --model_path，这里会尝试读取 cfg_args 还原 source_path、images、white_background 等。
+    命令行显式传入的值优先级更高。
+    """
     cmdlne_string = sys.argv[1:]
     cfgfile_string = "Namespace()"
     args_cmdline = parser.parse_args(cmdlne_string)

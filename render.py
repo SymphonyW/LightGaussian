@@ -23,6 +23,11 @@ from gaussian_renderer import GaussianModel
 
 
 def render_set(model_path, name, iteration, views, gaussians, pipeline, background):
+    """
+    渲染一组相机视角，并把预测图和 GT 图分别保存到 renders/ 和 gt/。
+
+    metrics.py 会读取这些目录计算 PSNR/SSIM/LPIPS，所以目录结构要和原版 3DGS 保持一致。
+    """
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
 
@@ -30,6 +35,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     makedirs(gts_path, exist_ok=True)
 
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
+        # 这里不需要梯度，外层 render_sets() 已经包了 torch.no_grad()。
         rendering = render(view, gaussians, pipeline, background)["render"]
         gt = view.original_image[0:3, :, :]
         torchvision.utils.save_image(
@@ -48,6 +54,12 @@ def render_sets(
     skip_test: bool,
     load_vq: bool, 
 ):
+    """
+    加载指定 iteration 的 Gaussian 并渲染 train/test split。
+
+    load_vq=True 时，Scene 会从 extreme_saving 目录恢复 VecTree/VQ 压缩模型；
+    否则从 point_cloud/iteration_x/point_cloud.ply 读取普通 PLY。
+    """
     with torch.no_grad():
         gaussians = GaussianModel(dataset.sh_degree)
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False, load_vq= load_vq)

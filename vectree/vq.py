@@ -124,6 +124,8 @@ def kmeans(
     sample_fn = batched_sample_vectors,
     all_reduce_fn = noop
 ):
+    # 可选的 codebook 初始化过程。LightGaussian 当前配置通常不用 kmeans 初始化，
+    # 但保留它可以用真实 SH 样本中心初始化 codebook，减少早期 EMA 更新的抖动。
     num_codebooks, dim, dtype, device = samples.shape[0], samples.shape[-1], samples.dtype, samples.device
 
     means = sample_fn(samples, num_clusters)
@@ -177,6 +179,21 @@ def orthogonal_loss_fn(t):
 # distance types
 
 class EuclideanCodebook(nn.Module):
+    """
+    基于欧氏距离的 VQ codebook。
+
+    前向时，每个输入向量会分配到最近的 code：
+        embed_ind = argmin ||x - code||
+        quantize = codebook[embed_ind]
+
+    训练时 codebook 不通过普通 optimizer 更新，而是使用 EMA：
+        cluster_size 统计每个 code 被命中的次数；
+        embed_sum 统计分配到该 code 的样本和；
+        embed 更新为 embed_sum / cluster_size 的指数滑动平均。
+
+    vectree.py 会把 Gaussian 的重要性分数作为 weight 传进来，使重要 Gaussian
+    对 codebook 更新影响更大，这是 importance-aware VQ 的核心。
+    """
     def __init__(
         self,
         dim,
@@ -260,10 +277,13 @@ class EuclideanCodebook(nn.Module):
 
     @autocast(enabled = False)
     def forward(self, x, weight=None, verbose=False):
+        # weight 通常来自每个 Gaussian 的重要性分数，形状类似 [1, batch, 1]。
+        # 归一化到平均值约为 1，可以保持 EMA 更新幅度稳定，同时保留相对重要性。
         if weight is not None:
             weight = weight * weight.numel()/weight.sum()
         needs_codebook_dim = x.ndim < 4
 
+        # 关闭 autocast 后显式使用 float，避免 half 精度下 cdist 和 EMA 统计不稳定。
         x = x.float()
 
         if needs_codebook_dim:
@@ -273,6 +293,7 @@ class EuclideanCodebook(nn.Module):
         flatten = rearrange(x, 'h ... d -> h (...) d')
         self.init_embed_(flatten)
         embed = self.embed if not self.learnable_codebook else self.embed.detach()
+        # dist 是负欧氏距离；后续使用 argmax，因此数值越大代表越接近某个 code。
         dist = -torch.cdist(flatten, embed, p = 2)
         embed_ind = gumbel_sample(dist, dim = -1, temperature = self.sample_codebook_temp)
         embed_onehot = F.one_hot(embed_ind, self.codebook_size).type(dtype)
@@ -282,6 +303,8 @@ class EuclideanCodebook(nn.Module):
         if self.training:
             
             if weight is not None:
+                # 有 importance weight 时，高分样本会让对应 code 的 cluster_size
+                # 增加更多，等价于让 codebook 更优先拟合关键 Gaussian。
                 cluster_size = (embed_onehot*weight).sum(dim = 1)
             else:
                 cluster_size = embed_onehot.sum(dim = 1)
@@ -295,6 +318,7 @@ class EuclideanCodebook(nn.Module):
             self.all_reduce_fn(embed_sum)
             cluster_size = laplace_smoothing(self.cluster_size, self.codebook_size, self.eps) * self.cluster_size.sum()
             
+            # EMA 更新 codebook 中心。这里直接更新 buffer，不依赖 optimizer.step()。
             ema_inplace(self.embed, embed_sum/rearrange(cluster_size, '... -> ... 1'), self.decay)
             self.expire_codes_(x, verbose)
             
@@ -306,6 +330,16 @@ class EuclideanCodebook(nn.Module):
 # main class
 
 class VectorQuantize(nn.Module):
+    """
+    对外使用的 VQ 封装层。
+
+    EuclideanCodebook 负责最近邻查表和 EMA 更新；VectorQuantize 额外处理：
+        输入/输出维度投影、多 head codebook、straight-through estimator、
+        commitment loss 和可选正交正则。
+
+    LightGaussian 的 VecTree 流程通常输入 [1, num_gaussians, sh_dim]，
+    输出 quantize 是 codebook 近似后的 SH 特征，embed_ind 是需要保存的 code index。
+    """
     def __init__(
         self,
         dim,
@@ -377,6 +411,8 @@ class VectorQuantize(nn.Module):
         return rearrange(codebook, '1 ... -> ...')
 
     def forward(self, x, weight=None, verbose=False):
+        # 这个模块支持通用的图像特征和多 head 形式；在 LightGaussian 中，
+        # x 通常已经是 channel-last 的 SH 特征序列，所以大多数转换分支保持默认。
         shape, device, heads, is_multiheaded, codebook_size = x.shape, x.device, self.heads, self.heads > 1, self.codebook_size
 
         need_transpose = not self.channel_last and not self.accept_image_fmap
@@ -397,12 +433,17 @@ class VectorQuantize(nn.Module):
         quantize, embed_ind = self._codebook(x, weight, verbose)
 
         if self.training:
+            # Straight-through estimator:
+            # 前向值使用量化后的 quantize，反向梯度近似当作 identity 传回 x。
+            # 这样上游特征可以感知量化误差，而 codebook 仍由 EMA 更新。
             quantize = x + (quantize - x).detach()
 
         loss = torch.tensor([0.], device = device, requires_grad = self.training)
 
         if self.training:
             if self.commitment_weight > 0:
+                # commitment loss 约束输入特征靠近选中的 code，避免 encoder 输出无限漂移。
+                # 在当前离线量化脚本中主要保留 VQ 接口完整性。
                 commit_loss = F.mse_loss(quantize.detach(), x)                                 # 对应VQRF公式(8)
                 loss = loss + commit_loss * self.commitment_weight
 

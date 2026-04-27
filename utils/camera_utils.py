@@ -18,14 +18,24 @@ WARNED = False
 
 
 def loadCam(args, id, cam_info, resolution_scale):
+    """
+    把 dataset_readers.CameraInfo 转成训练/渲染用的 scene.cameras.Camera。
+
+    CameraInfo 里图像还是 PIL Image，相机矩阵还是 numpy；Camera 会把图像转成
+    torch tensor，并预计算 CUDA rasterizer 需要的 world_view_transform、
+    projection_matrix、camera_center。
+    """
     orig_w, orig_h = cam_info.image.size
 
     if args.resolution in [1, 2, 4, 8]:
+        # --resolution 取 1/2/4/8 时表示按整数倍下采样。
         resolution = round(orig_w / (resolution_scale * args.resolution)), round(
             orig_h / (resolution_scale * args.resolution)
         )
     else:  # should be a type that converts to float
         if args.resolution == -1:
+            # 默认保护显存：宽度超过 1600 的图像会自动缩到 1600。
+            # 如果想用原图训练，显式传 --resolution 1。
             if orig_w > 1600:
                 global WARNED
                 if not WARNED:
@@ -38,6 +48,7 @@ def loadCam(args, id, cam_info, resolution_scale):
             else:
                 global_down = 1
         else:
+            # 其他数值表示目标宽度，例如 --resolution 800 会把宽缩到 800。
             global_down = orig_w / args.resolution
 
         scale = float(global_down) * float(resolution_scale)
@@ -45,6 +56,8 @@ def loadCam(args, id, cam_info, resolution_scale):
 
     resized_image_rgb = PILtoTorch(cam_info.image, resolution)
 
+    # PILtoTorch 会返回 [C,H,W]，RGBA 图像会有 4 个通道；训练图像只取 RGB，
+    # alpha 会作为 mask 乘到 original_image 上。
     gt_image = resized_image_rgb[:3, ...]
     loaded_mask = None
 
@@ -66,6 +79,8 @@ def loadCam(args, id, cam_info, resolution_scale):
 
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args):
+    # Scene 为每个 resolution_scale 建一套 Camera 列表。多数训练只用 1.0，
+    # 但保留这个结构可以支持多尺度训练/评估。
     camera_list = []
 
     for id, c in enumerate(cam_infos):
@@ -75,6 +90,8 @@ def cameraList_from_camInfos(cam_infos, resolution_scale, args):
 
 
 def camera_to_JSON(id, camera: Camera):
+    # 把 Camera 序列化到 cameras.json，方便外部工具或后续渲染检查相机轨迹。
+    # 这里输出 camera-to-world 的 position/rotation 和像素焦距 fx/fy。
     Rt = np.zeros((4, 4))
     Rt[:3, :3] = camera.R.transpose()
     Rt[:3, 3] = camera.T
