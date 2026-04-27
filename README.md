@@ -32,7 +32,7 @@ The used datasets, MipNeRF360 and Tank & Temple, are hosted by the paper authors
 
 For installation:
 ```
-git clone --recursive https://github.com/VITA-Group/LightGaussian.git
+git clone --recursive https://github.com/SymphonyW/LightGaussian.git
 cd LightGaussian
 # if you have already cloned LightGaussian:
 # git submodule update --init --recursive
