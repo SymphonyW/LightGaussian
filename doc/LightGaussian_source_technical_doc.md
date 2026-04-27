@@ -1989,3 +1989,667 @@ render_sets()
 * VecTree 当前压缩 SH 特征为主，渲染前会反量化为 dense Gaussian，不要误以为它已经实现了 codebook 直接渲染。
 * `GaussianModel` 的 optimizer param group 名称和 `_prune_optimizer()`、`cat_tensors_to_optimizer()` 强耦合。新增属性时必须同时维护这几处。
 * PLY 属性顺序和 `vectree/utils.py::read_ply_data()`、`write_ply_data()` 强耦合。改 PLY 字段顺序会影响 VecTree 切片逻辑。
+
+# 9. 源码阅读路线图（建议按这个顺序看）
+
+这部分是面向“真正读懂源码”的路线图。LightGaussian 不是一个从零写的新渲染器，而是在 3DGS 的代码骨架上增加压缩能力。因此读代码时不要一上来钻 CUDA kernel，建议按下面顺序逐层深入：
+
+```text
+README / scripts
+  |
+  v
+arguments/__init__.py
+  |
+  v
+scene/dataset_readers.py -> utils/camera_utils.py -> scene/cameras.py
+  |
+  v
+scene/__init__.py -> scene/gaussian_model.py
+  |
+  v
+gaussian_renderer/__init__.py
+  |
+  v
+train_densify_prune.py / prune_finetune.py / distill_train.py
+  |
+  v
+prune.py
+  |
+  v
+submodules/compress-diff-gaussian-rasterization
+  |
+  v
+vectree/vectree.py -> vectree/vq.py -> vectree/utils.py
+```
+
+读源码时可以把项目拆成四个层次：
+
+| 层次 | 你要回答的问题 | 主要文件 |
+|---|---|---|
+| 数据层 | 图像、相机、点云如何进入训练？ | `scene/dataset_readers.py`, `utils/camera_utils.py`, `scene/cameras.py` |
+| 表示层 | 一个 Gaussian 到底有哪些参数？这些参数如何训练、保存、剪枝？ | `scene/gaussian_model.py` |
+| 渲染层 | Python 如何把 Gaussian 和相机交给 CUDA？CUDA 返回什么？ | `gaussian_renderer/__init__.py`, `submodules/...` |
+| 压缩层 | LightGaussian 如何比原始 3DGS 更小？ | `prune.py`, `prune_finetune.py`, `distill_train.py`, `vectree/` |
+
+如果你时间有限，优先读下面 8 个函数：
+
+| 优先级 | 函数 | 为什么重要 |
+|---:|---|---|
+| 1 | `GaussianModel.create_from_pcd()` | 从点云生成初始 Gaussian，是训练起点 |
+| 2 | `GaussianModel.training_setup()` | 定义哪些参数被优化，以及各自学习率 |
+| 3 | `gaussian_renderer.render()` | Python 到 CUDA rasterizer 的主入口 |
+| 4 | `train_densify_prune.training()` | 从头训练、densify、剪枝、保存的完整循环 |
+| 5 | `GaussianModel.densify_and_prune()` | 原始 3DGS 自适应增删点机制 |
+| 6 | `prune.prune_list()` | LightGaussian 全局重要性统计入口 |
+| 7 | `distill_train.training()` | SH 降阶蒸馏的 teacher-student 逻辑 |
+| 8 | `Quantization.quantize()` | VecTree/VQ 压缩的核心流程 |
+
+# 10. 关键张量与形状总表
+
+理解这个项目的最快方式之一，是把所有核心 tensor 的形状记住。下面的 `N` 表示 Gaussian 数量，`K=(sh_degree+1)^2` 表示 SH 系数数量。
+
+| 名称 | 位置 | 典型形状 | 物理意义 | 注意点 |
+|---|---|---:|---|---|
+| `_xyz` | `GaussianModel` | `[N, 3]` | Gaussian 中心，世界坐标 | 直接优化 |
+| `_features_dc` | `GaussianModel` | `[N, 1, 3]` | SH DC 项，近似基础颜色 | 学习率较高 |
+| `_features_rest` | `GaussianModel` | `[N, K-1, 3]` | SH 高阶项，视角相关颜色 | 学习率是 `feature_lr/20` |
+| `_opacity` | `GaussianModel` | `[N, 1]` | inverse-sigmoid 空间的 alpha | 真值用 `sigmoid` |
+| `_scaling` | `GaussianModel` | `[N, 3]` | log 空间的椭球三轴尺度 | 真值用 `exp` |
+| `_rotation` | `GaussianModel` | `[N, 4]` | 四元数旋转 | 使用前 normalize |
+| `max_radii2D` | `GaussianModel` | `[N]` | 每个 Gaussian 最大屏幕投影半径 | densify/prune 用 |
+| `xyz_gradient_accum` | `GaussianModel` | `[N, 1]` | 屏幕空间梯度累计 | densify 用 |
+| `denom` | `GaussianModel` | `[N, 1]` | 梯度累计次数 | 求平均梯度用 |
+| `screenspace_points` | `render()` | `[N, 3]` | 2D 均值梯度占位 | 不是实际 2D 坐标 |
+| `radii` | rasterizer 返回 | `[N]` | 屏幕空间半径 | `radii>0` 表示可见 |
+| `visibility_filter` | `render()` 返回 | `[N] bool` | 当前视角可见 mask | densify 只更新可见点 |
+| `gaussians_count` | `count_render()` 返回 | `[N]` | 每个 Gaussian 参与统计 | 剪枝候选分数 |
+| `important_score` | `count_render()` 返回 | `[N]` | 每个 Gaussian 贡献统计 | LightGaussian 核心 |
+| `v_list` | `calculate_v_imp_score()` | `[N]` | volume-aware importance | 分数越低越先删 |
+
+SH 维度展开关系：
+
+| `sh_degree` | `K=(degree+1)^2` | `_features_dc` 通道 | `_features_rest` 通道 | PLY 中 `f_rest_*` 数量 |
+|---:|---:|---:|---:|---:|
+| 0 | 1 | 3 | 0 | 0 |
+| 1 | 4 | 3 | 9 | 9 |
+| 2 | 9 | 3 | 24 | 24 |
+| 3 | 16 | 3 | 45 | 45 |
+
+PLY 属性顺序非常重要：
+
+```text
+x, y, z,
+nx, ny, nz,
+f_dc_0, f_dc_1, f_dc_2,
+f_rest_0 ... f_rest_M,
+opacity,
+scale_0, scale_1, scale_2,
+rot_0, rot_1, rot_2, rot_3
+```
+
+这个顺序同时被下面几处依赖：
+
+| 依赖点 | 文件 | 如果顺序改错会怎样 |
+|---|---|---|
+| 保存 PLY | `GaussianModel.save_ply()` | 后续读取字段混乱 |
+| 读取 PLY | `GaussianModel.load_ply()` | assert 失败或属性错位 |
+| VecTree 读取 | `vectree/utils.py::read_ply_data()` | SH、opacity、scale、rotation 切片错位 |
+| VecTree 写回 | `vectree/utils.py::write_ply_data()` | 反量化 PLY 无法正确渲染 |
+
+# 11. 端到端调用链详解
+
+## 从头训练并剪枝
+
+命令通常类似：
+
+```bash
+python train_densify_prune.py -s DATASET -m MODEL --iterations 30000
+```
+
+调用链：
+
+```text
+main
+-> ModelParams / OptimizationParams / PipelineParams
+-> safe_state()
+-> network_gui.init()
+-> training(...)
+   -> prepare_output_and_logger()
+   -> GaussianModel(dataset.sh_degree)
+   -> Scene(dataset, gaussians)
+      -> readColmapSceneInfo() or readNerfSyntheticInfo()
+      -> cameraList_from_camInfos()
+      -> GaussianModel.create_from_pcd()
+   -> gaussians.training_setup(opt)
+   -> for iteration:
+      -> network_gui.try_connect()
+      -> gaussians.update_learning_rate()
+      -> gaussians.oneupSHdegree()
+      -> sample train camera
+      -> render()
+      -> loss = L1 + DSSIM
+      -> loss.backward()
+      -> gaussians.add_densification_stats()
+      -> gaussians.densify_and_prune()
+      -> prune_list() at prune_iterations
+      -> calculate_v_imp_score()
+      -> gaussians.prune_gaussians()
+      -> optimizer.step()
+      -> scene.save() / torch.save()
+```
+
+训练循环中每一轮最关键的状态变化：
+
+| 阶段 | 输入 | 输出 | 是否反向传播 | 备注 |
+|---|---|---|---|---|
+| 采样相机 | `scene.getTrainCameras()` | `viewpoint_cam` | 否 | 当前 batch 只有一个视角 |
+| 渲染 | camera + gaussians | `image`, `radii`, `viewspace_points` | 是 | CUDA autograd |
+| loss | `image`, `gt_image` | scalar loss | 是 | L1 + DSSIM |
+| backward | loss | Gaussian 参数梯度 | 是 | 包括 xyz/SH/opacity/scale/rotation |
+| densify 统计 | `viewspace_points.grad` | `xyz_gradient_accum` | 否 | `torch.no_grad()` 中累计 |
+| densify/prune | 梯度、opacity、radii | 新的 Gaussian 集合 | 否 | 会改 optimizer state |
+| optimizer | 参数梯度 | 更新后的参数 | 否 | AdamW |
+| LightGaussian 剪枝 | 全局重要性分数 | 更少的 Gaussian | 否 | 只在指定 iteration 做 |
+
+## 加载已有模型剪枝恢复
+
+命令通常类似：
+
+```bash
+python prune_finetune.py -s DATASET -m MODEL --start_pointcloud PATH/point_cloud.ply
+```
+
+关键差异：
+
+| 对比项 | `train_densify_prune.py` | `prune_finetune.py` |
+|---|---|---|
+| 初始化 | 从输入点云初始化 Gaussian | 从 checkpoint 或 point_cloud.ply 初始化 |
+| 主要目的 | 训练过程中加入剪枝 | 对已有模型做压缩和恢复 |
+| densify | 默认启用原始 3DGS densify | 代码保留入口但默认关闭 |
+| 剪枝类型 | 默认 volume-aware | 支持多种 `prune_type` |
+| 常见输出 | point_cloud, checkpoint, imp_score | 剪枝后 point_cloud, checkpoint, imp_score |
+
+`prune_type` 分支含义：
+
+| `prune_type` | 使用分数 | 直觉 | 风险 |
+|---|---|---|---|
+| `important_score` | `imp_list` | 按像素贡献删 | 可能偏向删除大而稀疏的结构 |
+| `v_important_score` | `calculate_v_imp_score()` | 像素贡献 + 体积修正 | `v_pow` 需要调 |
+| `max_v_important_score` | `imp_list * max(scale)` | 保留长条/大尺度结构 | 可能保留不重要的大点 |
+| `count` | `gaussian_list` | 按参与次数 | 不直接衡量颜色贡献 |
+| `opacity` | `get_opacity` | 简单 baseline | 可能误删低 alpha 细节 |
+
+## SH 蒸馏
+
+命令通常类似：
+
+```bash
+python distill_train.py -s DATASET -m STUDENT_MODEL --teacher_model TEACHER.pth --start_checkpoint STUDENT.pth --new_max_sh 2
+```
+
+逻辑：
+
+```text
+teacher: 高阶 SH Gaussian，通常质量更好，参数更多
+student: 低阶 SH Gaussian，参数更少
+
+for each iteration:
+    sample camera
+    optional augmented camera
+    teacher_image = render(teacher).detach()
+    student_image = render(student)
+    loss = L1(student_image, teacher_image) + DSSIM
+    update student only
+```
+
+为什么不是直接拟合 GT 图像：
+
+| 训练目标 | 优点 | 缺点 |
+|---|---|---|
+| 拟合真实图像 | 直接恢复数据集指标 | 低阶 SH 容量不足时可能不稳定 |
+| 拟合 teacher 渲染 | 目标更平滑，保留 teacher 行为 | 质量上限受 teacher 限制 |
+
+冻结开关：
+
+| 参数 | 默认状态 | 影响 |
+|---|---|---|
+| `--enable_covariance` | 默认不启用 | 不传时冻结 scale/rotation |
+| `--enable_opacity` | 默认不启用 | 不传时冻结 opacity |
+| `--augmented_view` | 默认不启用 | 启用后加入虚拟扰动视角 |
+
+## VecTree / VQ 量化
+
+命令通常类似：
+
+```bash
+python vectree/vectree.py \
+  --important_score_npz_path MODEL \
+  --input_path MODEL/point_cloud/iteration_40000/point_cloud.ply \
+  --save_path MODEL \
+  --sh_degree 2 \
+  --vq_ratio 0.6
+```
+
+核心思想：
+
+```text
+所有 Gaussian SH 特征
+  |
+  |-- 高重要性部分: 不量化，直接 half 保存
+  |
+  |-- 低重要性部分: 用 VQ codebook 表示，只保存 code index
+```
+
+`vq_ratio` 的直觉：
+
+| `vq_ratio` | 进入 VQ 的比例 | 直接保存原始 SH 的比例 | 效果倾向 |
+|---:|---:|---:|---|
+| 0.3 | 30% | 70% | 质量更稳，压缩较弱 |
+| 0.6 | 60% | 40% | 常见折中 |
+| 0.9 | 90% | 10% | 压缩强，质量风险高 |
+
+`extreme_saving/` 目录文件解释：
+
+| 文件 | 内容 | 用途 |
+|---|---|---|
+| `metadata.npz` | 点数、原始维度、codebook 大小、SH 维度 | 反量化时恢复形状 |
+| `codebook.npz` | VQ codebook | 用 index 还原低重要性 SH |
+| `vq_indexs.npz` | bit-pack 后的 code index | 压缩保存低重要性 SH |
+| `non_vq_mask.npz` | 哪些 Gaussian 不量化 | 区分原始 SH 和 VQ SH |
+| `non_vq_feats.npz` | 高重要性 Gaussian 的 SH | 质量优先保存 |
+| `other_attribute.npz` | opacity + scale + rotation | 几何和 alpha 属性 |
+| `xyz.npz` | Gaussian 中心 | 空间位置 |
+
+反量化调用链：
+
+```text
+render.py/render_video.py --load_vq
+-> Scene(..., load_vq=True)
+-> GaussianModel.load_vq(model_path)
+-> load_vqgaussian(model_path/extreme_saving)
+-> 拼回 dense Gaussian attribute matrix
+-> GaussianModel 设置 _xyz/_features_dc/_features_rest/_opacity/_scaling/_rotation
+-> render()
+```
+
+# 12. 关键机制用伪代码重写
+
+## `render()` 的本质
+
+```python
+def render(camera, gaussians, pipe, background):
+    screenspace_points = zeros_like(gaussians.xyz, requires_grad=True)
+
+    raster_settings = {
+        image_size,
+        tanfovx, tanfovy,
+        bg,
+        viewmatrix,
+        projmatrix,
+        sh_degree,
+        camera_center,
+        f_count=False,
+    }
+
+    if pipe.compute_cov3D_python:
+        cov3D = gaussians.get_covariance()
+    else:
+        scales = gaussians.get_scaling
+        rotations = gaussians.get_rotation
+
+    if pipe.convert_SHs_python:
+        colors = eval_sh(...)
+    else:
+        shs = gaussians.get_features
+
+    image, radii = rasterizer(
+        means3D=gaussians.xyz,
+        means2D=screenspace_points,
+        shs=shs,
+        colors_precomp=colors,
+        opacities=gaussians.get_opacity,
+        scales=scales,
+        rotations=rotations,
+        cov3D_precomp=cov3D,
+    )
+
+    return image, screenspace_points, radii > 0, radii
+```
+
+一句话：`render()` 是把 Python 中的 Gaussian 参数转换成 CUDA rasterizer 所需参数，并保留屏幕空间梯度。
+
+## `count_render()` 的本质
+
+```python
+def count_render(camera, gaussians, pipe, background):
+    raster_settings.f_count = True
+    gaussians_count, important_score, image, radii = rasterizer(...)
+    return gaussians_count, important_score, image, radii
+```
+
+一句话：`count_render()` 和 `render()` 几乎一样，只是打开了 CUDA 中的统计分支。
+
+## `prune_list()` 的本质
+
+```python
+def prune_list(gaussians, scene, pipe, background):
+    total_count = zeros(N)
+    total_score = zeros(N)
+
+    for camera in scene.train_cameras:
+        pkg = count_render(camera, gaussians, pipe, background)
+        total_count += pkg.gaussians_count.detach()
+        total_score += pkg.important_score.detach()
+
+    return total_count, total_score
+```
+
+一句话：它用所有训练视角，而不是单个 batch，统计全局重要性。
+
+## `calculate_v_imp_score()` 的本质
+
+```python
+volume = scale_x * scale_y * scale_z
+ref = sorted(volume, descending=True)[int(0.9 * N)]
+volume_weight = (volume / ref) ** v_pow
+score = volume_weight * important_score
+```
+
+直觉：
+
+| 项 | 作用 |
+|---|---|
+| `important_score` | 衡量像素贡献 |
+| `volume` | 衡量空间覆盖 |
+| `v_pow` | 控制体积修正强度 |
+
+## `prune_gaussians()` 的本质
+
+```python
+threshold = percentile(import_score, percent)
+delete_mask = import_score <= threshold
+prune_points(delete_mask)
+```
+
+注意 mask 语义：
+
+| 函数 | mask=True 表示 |
+|---|---|
+| `prune_gaussians()` 内部生成的 `prune_mask` | 删除 |
+| `prune_points(mask)` 的 `mask` | 删除 |
+| `_prune_optimizer(mask)` 的 `mask` | 保留 |
+
+这个语义差异是二次开发最容易写错的地方之一。
+
+## `densify_and_clone()` 的本质
+
+```python
+selected = grad_norm >= threshold and max_scale <= percent_dense * scene_extent
+new_gaussian = copy(selected_gaussian)
+append_to_optimizer(new_gaussian)
+```
+
+适用对象：小而关键的 Gaussian。
+
+## `densify_and_split()` 的本质
+
+```python
+selected = grad >= threshold and max_scale > percent_dense * scene_extent
+samples = normal(mean=0, std=selected_scale)
+new_xyz = selected_xyz + rotation @ samples
+new_scale = selected_scale / (0.8 * N)
+append(new_gaussians)
+delete(original_selected_gaussians)
+```
+
+适用对象：大而关键的 Gaussian。
+
+## `cat_tensors_to_optimizer()` 为什么复杂
+
+普通 PyTorch 训练中，参数数量固定；但 3DGS 训练中 Gaussian 数量会变：
+
+```text
+densify: N -> N + M
+prune:   N -> N - K
+```
+
+AdamW optimizer 内部保存：
+
+```text
+param tensor
+exp_avg
+exp_avg_sq
+step
+```
+
+如果只改 `self._xyz`，不改 optimizer 的 `exp_avg/exp_avg_sq`，下一次 `optimizer.step()` 就会 shape 不匹配。所以：
+
+| 操作 | 参数 tensor | optimizer state |
+|---|---|---|
+| densify append | `torch.cat(old, new)` | `torch.cat(old_state, zeros_like(new))` |
+| prune delete | `old[valid_mask]` | `old_state[valid_mask]` |
+| reset opacity | replace tensor | state 置零 |
+
+# 13. 文件级职责和阅读检查表
+
+| 文件 | 必读程度 | 读完应理解什么 |
+|---|---:|---|
+| `arguments/__init__.py` | 中 | 参数如何自动注册、如何从 `cfg_args` 合并 |
+| `scene/dataset_readers.py` | 高 | COLMAP/Blender 如何变成 `SceneInfo` |
+| `utils/camera_utils.py` | 中 | 图像分辨率如何缩放，Camera 如何构造 |
+| `scene/cameras.py` | 高 | view/projection matrix 如何预计算 |
+| `scene/__init__.py` | 高 | Scene 如何选择数据集、加载 PLY/VQ 或初始化点云 |
+| `scene/gaussian_model.py` | 最高 | Gaussian 参数、optimizer、densify、prune、PLY/VQ |
+| `gaussian_renderer/__init__.py` | 最高 | Python 到 CUDA rasterizer 的桥接 |
+| `train_densify_prune.py` | 高 | 完整训练循环 |
+| `prune_finetune.py` | 高 | 加载已有模型剪枝恢复 |
+| `prune.py` | 高 | 全局重要性统计和 volume-aware score |
+| `distill_train.py` | 高 | SH teacher-student 蒸馏 |
+| `vectree/vectree.py` | 高 | 量化流程和保存格式 |
+| `vectree/vq.py` | 中 | VQ codebook 的 EMA 更新 |
+| `vectree/utils.py` | 中 | extreme_saving 如何反量化 |
+| `render.py` | 中 | train/test 渲染输出 |
+| `render_video.py` | 中 | 相机轨迹渲染 |
+
+读完每个关键文件后，可以用下面的问题自测：
+
+| 文件 | 自测问题 |
+|---|---|
+| `gaussian_model.py` | 为什么 `_scaling` 不直接保存正数尺度？ |
+| `gaussian_model.py` | `prune_points()` 为什么要修改 optimizer state？ |
+| `gaussian_renderer/__init__.py` | `screenspace_points` 为什么是 zeros_like？ |
+| `prune.py` | 为什么不能只看一个视角做剪枝？ |
+| `distill_train.py` | 为什么 teacher 渲染结果要 `.detach()`？ |
+| `vectree.py` | 为什么高重要性 Gaussian 不进入 VQ？ |
+| `scene/__init__.py` | `load_vq=True` 和 `load_iteration` 的加载路径有什么区别？ |
+
+# 14. 调试建议和断点位置
+
+如果你想跟一遍从训练到渲染的流程，建议按下面位置打断点或加打印：
+
+| 目标 | 断点位置 | 建议观察 |
+|---|---|---|
+| 确认数据集类型 | `Scene.__init__()` | 是否走 Colmap/Blender |
+| 确认相机数量 | `cameraList_from_camInfos()` 返回后 | train/test cameras 数量 |
+| 确认初始点数 | `create_from_pcd()` | `fused_point_cloud.shape` |
+| 确认参数组 | `training_setup()` | optimizer param group 名称和 shape |
+| 确认渲染输出 | `render()` 返回前 | `rendered_image.shape`, `radii>0` 数量 |
+| 确认 loss | training loop | `Ll1`, `loss` |
+| 确认 densify | `densify_and_prune()` 前后 | Gaussian 数量变化 |
+| 确认剪枝分数 | `prune_list()` 返回后 | `imp_list.min/max/mean` |
+| 确认剪枝阈值 | `prune_gaussians()` | percentile threshold |
+| 确认 VQ 掩码 | `Quantization.quantize()` | `non_vq_mask.sum()`, `vq_mask.sum()` |
+
+推荐打印代码片段：
+
+```python
+print("N:", gaussians.get_xyz.shape[0])
+print("opacity:", gaussians.get_opacity.min().item(), gaussians.get_opacity.max().item())
+print("scale:", gaussians.get_scaling.min().item(), gaussians.get_scaling.max().item())
+print("visible:", visibility_filter.sum().item())
+print("radii:", radii.max().item())
+```
+
+剪枝前建议打印：
+
+```python
+print("count:", gaussian_list.min(), gaussian_list.mean(), gaussian_list.max())
+print("imp:", imp_list.min(), imp_list.mean(), imp_list.max())
+print("v:", v_list.min(), v_list.mean(), v_list.max())
+```
+
+VecTree 前建议打印：
+
+```python
+print("all feats:", self.feats_bak.shape)
+print("vq feats:", self.feats.shape)
+print("non_vq:", self.non_vq_mask.sum())
+print("vq:", self.vq_mask.sum())
+print("codebook:", self.model_vq._codebook.embed.shape)
+```
+
+# 15. 重要参数解释
+
+| 参数 | 所在脚本 | 含义 | 调大影响 | 调小影响 |
+|---|---|---|---|---|
+| `--iterations` | train/prune/distill | 总训练轮数 | 质量更稳，耗时更长 | 更快但可能欠拟合 |
+| `--sh_degree` | common | 最大 SH 阶数 | 表达力更强，模型更大 | 模型更小，视角相关外观变弱 |
+| `--lambda_dssim` | optimization | DSSIM loss 权重 | 更重结构一致性 | 更重 L1 像素拟合 |
+| `--densify_until_iter` | optimization | densify 截止轮数 | 结构增长更久 | 更早固定结构 |
+| `--densify_grad_threshold` | optimization | densify 梯度阈值 | 更少 densify | 更多 densify |
+| `--opacity_reset_interval` | optimization | opacity 重置周期 | 重置更少 | 重置更频繁 |
+| `--prune_iterations` | prune scripts | 剪枝发生轮数 | 多次剪枝 | 少次剪枝 |
+| `--prune_percent` | prune scripts | 每次剪掉比例 | 压缩更强，质量风险更大 | 更保守 |
+| `--prune_decay` | prune scripts | 多次剪枝比例衰减 | 后续剪枝更温和 | 每次剪枝更接近 |
+| `--v_pow` | prune scripts | 体积修正指数 | 更偏向保留大 Gaussian | 更接近纯 important_score |
+| `--new_max_sh` | distill | student SH 阶数 | 质量更好，模型更大 | 模型更小，质量风险更大 |
+| `--vq_ratio` | vectree | 进入 VQ 的比例 | 压缩更强 | 质量更稳 |
+| `--codebook_size` | vectree | VQ codebook 大小 | 量化误差更小，codebook 更大 | 更小但误差更大 |
+
+# 16. 二次开发清单
+
+## 改剪枝策略
+
+最小改动路径：
+
+```text
+1. 在 prune.py 新增 score 计算函数
+2. 在 prune_finetune.py 增加 --prune_type 分支
+3. 调用 gaussians.prune_gaussians(percent, score)
+4. 观察剪枝前后 N、PSNR、SSIM、LPIPS
+```
+
+必须保证：
+
+| 检查项 | 原因 |
+|---|---|
+| score shape 是 `[N]` 或 `[N,1]` | `prune_gaussians()` 按 Gaussian 排序 |
+| score 越小越应该删 | 现有阈值逻辑是 `<= percentile` |
+| score 在 CUDA 上 | 避免 device mismatch |
+| 不需要梯度 | 剪枝统计在 `torch.no_grad()` 中用 |
+
+## 改 rasterizer 统计项
+
+需要同时改：
+
+| 层 | 文件 |
+|---|---|
+| Python 调用 | `gaussian_renderer/__init__.py` |
+| Python autograd wrapper | `diff_gaussian_rasterization/__init__.py` |
+| C++ binding | `ext.cpp`, `rasterize_points.cu/h` |
+| CUDA 实现 | `cuda_rasterizer/forward.cu`, `rasterizer_impl.cu` |
+| 上层使用 | `prune.py`, `prune_finetune.py` |
+
+建议流程：
+
+```text
+先让 CUDA 返回一个全 0/全 1 tensor
+-> 确认 Python 能收到 shape 正确的 tensor
+-> 再实现真实统计逻辑
+-> 最后接入 prune score
+```
+
+## 新增 Gaussian 属性
+
+必须同步维护：
+
+| 位置 | 需要做什么 |
+|---|---|
+| `GaussianModel.__init__()` | 新增空 tensor |
+| `create_from_pcd()` / `load_ply()` | 初始化或加载 |
+| `training_setup()` | 加入 optimizer param group |
+| `capture()` / `restore()` | checkpoint 保存恢复 |
+| `save_ply()` / `construct_list_of_attributes()` | PLY 保存 |
+| `_prune_optimizer()` | 删除 Gaussian 时同步裁剪 |
+| `cat_tensors_to_optimizer()` | densify 时同步拼接 |
+| `gaussian_renderer.render()` | 传给 rasterizer |
+| CUDA rasterizer | 真正使用这个属性 |
+
+## 改 VecTree 保存格式
+
+必须同步维护：
+
+| 保存端 | 加载端 |
+|---|---|
+| `Quantization.fully_vq_reformat()` | `vectree/utils.py::load_vqgaussian()` |
+| `write_ply_data()` | `GaussianModel.load_vq()` |
+
+不要只改保存，不改加载；否则 `--load_vq` 会恢复错误属性。
+
+# 17. 一句话总结各核心文件
+
+| 文件 | 一句话 |
+|---|---|
+| `scene/dataset_readers.py` | 把外部数据集读成统一的 `SceneInfo` |
+| `scene/__init__.py` | 把 `SceneInfo` 变成相机列表和 GaussianModel |
+| `scene/gaussian_model.py` | 管理所有 Gaussian 参数及其增删、保存、加载 |
+| `gaussian_renderer/__init__.py` | 把 Python 参数打包给 CUDA rasterizer |
+| `train_densify_prune.py` | 从头训练，并在训练中做 LightGaussian 剪枝 |
+| `prune_finetune.py` | 对已有模型剪枝并继续优化恢复质量 |
+| `prune.py` | 计算全局重要性分数 |
+| `distill_train.py` | 用高阶 teacher 监督低阶 student |
+| `vectree/vectree.py` | 把 SH 特征按重要性分成保留和 VQ 两部分 |
+| `vectree/vq.py` | 实现 codebook 查表和 EMA 更新 |
+| `vectree/utils.py` | 读写量化后的 `extreme_saving` 格式 |
+| `render.py` | 批量渲染 train/test 并保存 png |
+| `render_video.py` | 沿轨迹渲染视频帧 |
+
+# 18. 建议的阅读节奏
+
+如果你是第一次读这个项目，建议分三轮。
+
+第一轮只看 Python 主链路：
+
+```text
+scene/__init__.py
+scene/gaussian_model.py
+gaussian_renderer/__init__.py
+train_densify_prune.py
+prune.py
+```
+
+目标：知道数据怎么来、Gaussian 怎么表示、训练怎么跑、剪枝怎么删。
+
+第二轮看压缩链路：
+
+```text
+prune_finetune.py
+distill_train.py
+vectree/vectree.py
+vectree/vq.py
+vectree/utils.py
+```
+
+目标：理解 LightGaussian 的 3 个压缩阶段：剪枝、SH 蒸馏、VQ。
+
+第三轮再看 CUDA：
+
+```text
+submodules/compress-diff-gaussian-rasterization/diff_gaussian_rasterization/__init__.py
+submodules/compress-diff-gaussian-rasterization/rasterize_points.cu
+submodules/compress-diff-gaussian-rasterization/cuda_rasterizer/forward.cu
+submodules/compress-diff-gaussian-rasterization/cuda_rasterizer/backward.cu
+submodules/compress-diff-gaussian-rasterization/cuda_rasterizer/rasterizer_impl.cu
+```
+
+目标：理解 tile-based splatting、排序、alpha blending、反传，以及 LightGaussian 增加的统计分支。
