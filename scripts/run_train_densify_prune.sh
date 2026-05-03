@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Function to get the id of an available GPU
+# 获取当前可用 GPU 的编号：显存占用低于阈值时认为该 GPU 空闲
 get_available_gpu() {
   local mem_threshold=5000
   nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits | \
@@ -9,9 +9,10 @@ get_available_gpu() {
     '
 }
 
+# 分布式/网络通信使用的初始端口号，每启动一个任务后递增，避免端口冲突
 port=6035
 
-# Only one dataset specified here
+# 需要训练的数据集名称列表；取消注释或新增条目即可批量运行多个数据集
 declare -a run_args=(
     "bicycle"
     # "bonsai"
@@ -24,43 +25,44 @@ declare -a run_args=(
     # "truck"
 )
 
-# prune percentage for the first prune
+# 第一次剪枝使用的剪枝比例
 declare -a prune_percents=(0.6)
 
-# decay rate for the following prune
+# 后续剪枝的衰减率
 declare -a prune_decays=(0.6)
 
-# The volumetric importance power
+# 体积重要性指数；会影响基于体积的重要性评分权重
 declare -a v_pow=(0.1)
 
-# Prune types
+# 剪枝策略类型
 declare -a prune_types=(
   "v_important_score"
 )
 
-# Check that prune_percents and prune_decays arrays have the same length
+# 检查剪枝比例和衰减率数组长度是否一致，避免参数组合错位
 if [ "${#prune_percents[@]}" -ne "${#prune_decays[@]}" ]; then
   echo "The number of prune_percents does not match the number of prune_decays."
   exit 1
 fi
 
-# Loop over datasets
+# 遍历数据集、剪枝参数和剪枝策略，为每个组合启动一次 train_densify_prune.py
 for arg in "${run_args[@]}"; do
-  # Loop over each index in prune_percents/decays/v_pow
+  # 按相同下标读取 prune_percents、prune_decays 和 v_pow 中的参数
   for i in "${!prune_percents[@]}"; do
     prune_percent="${prune_percents[i]}"
     prune_decay="${prune_decays[i]}"
     vp="${v_pow[i]}"
 
-    # Loop over each prune type
+    # 遍历不同剪枝策略
     for prune_type in "${prune_types[@]}"; do
 
-      # Wait for an available GPU
+      # 等待直到找到一张显存占用低于阈值的 GPU
       while true; do
         gpu_id=$(get_available_gpu)
         if [[ -n $gpu_id ]]; then
           echo "GPU $gpu_id is available. Starting train_densify_prune.py with dataset '$arg', prune_percent '$prune_percent', prune_type '$prune_type', prune_decay '$prune_decay', and v_pow '$vp' on port $port"
 
+          # 绑定到选中的 GPU，后台启动训练中的 densify/prune 流程，并将日志写入 logs 目录
           CUDA_VISIBLE_DEVICES=$gpu_id nohup python train_densify_prune.py \
             -s "PATH/TO/DATASET/$arg" \
             -m "OUTPUT/PATH/${arg}" \
@@ -72,10 +74,10 @@ for arg in "${run_args[@]}"; do
             --port "$port" \
             > "logs/train_${arg}.log" 2>&1 &
 
-          # you need to create the log folder first if it doesn't exist
+          # 使用前需要确保 logs 目录已经存在
           ((port++))
 
-          # Give the process time to start using GPU memory
+          # 给进程预留初始化和占用显存的时间，避免下一轮误判 GPU 仍为空闲
           sleep 60
           break
         else
@@ -88,6 +90,6 @@ for arg in "${run_args[@]}"; do
   done    # end for i
 done      # end for arg
 
-# Wait for all background processes to finish
+# 等待所有后台任务执行结束后再退出脚本
 wait
 echo "All train_densify_prune.py runs completed."

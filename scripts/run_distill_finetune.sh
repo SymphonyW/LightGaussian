@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Function to get the id of an available GPU
+# 获取当前可用 GPU 的编号：显存占用低于阈值时认为该 GPU 空闲
 get_available_gpu() {
   local mem_threshold=500
   nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits | awk -v threshold="$mem_threshold" -F', ' '
@@ -8,10 +8,10 @@ get_available_gpu() {
   '
 }
 
-# Initial port number
+# 分布式/网络通信使用的初始端口号，每启动一个任务后递增，避免端口冲突
 port=6025
 
-# Datasets
+# 需要蒸馏微调的数据集名称列表
 declare -a run_args=(
     "bicycle"
     "bonsai"
@@ -25,19 +25,21 @@ declare -a run_args=(
 )
 
 
-# activate psudo view, else using train view for distillation 
+# 是否启用增强/伪视角进行蒸馏；如果不传该参数，则默认使用训练视角
 declare -a virtue_view_arg=(
   "--augmented_view"
 )
-# compress_gaussian/output5_prune_final_result/bicycle_v_important_score_oneshot_prune_densify0.67_vpow0.1_try3_decay1
-# compress_gaussian/output2
+
+# 遍历数据集和视角配置，为每个组合启动一次 distill_train.py
 for arg in "${run_args[@]}"; do
   for view in "${virtue_view_arg[@]}"; do
-    # Wait for an available GPU
+    # 等待直到找到一张显存占用低于阈值的 GPU
     while true; do
       gpu_id=$(get_available_gpu)
       if [[ -n $gpu_id ]]; then
         echo "GPU $gpu_id is available. Starting distill_train.py with dataset '$arg' and options '$view' on port $port"
+
+        # 绑定到选中的 GPU，后台启动蒸馏微调任务，并将日志写入 logs 目录
         CUDA_VISIBLE_DEVICES=$gpu_id nohup python distill_train.py \
           -s "PATH/TO/DATASET/$arg" \
           -m "OUTPUT/PATH/${arg}_${prune_percent}" \
@@ -51,9 +53,9 @@ for arg in "${run_args[@]}"; do
           $view \
           --port $port > "logs/distill_${arg}${view}.log" 2>&1 &
 
-        # Increment the port number for the next run
+        # 为下一个任务递增端口号
         ((port++))
-        # Allow some time for the process to initialize and potentially use GPU memory
+        # 给进程预留初始化和占用显存的时间，避免下一轮误判 GPU 仍为空闲
         sleep 60
         break
       else
@@ -63,5 +65,6 @@ for arg in "${run_args[@]}"; do
     done
   done
 done
+# 等待所有后台任务执行结束后再退出脚本
 wait
 echo "All distill_train.py runs completed."
