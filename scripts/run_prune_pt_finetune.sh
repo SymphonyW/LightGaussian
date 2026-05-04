@@ -71,11 +71,11 @@ for arg in "${run_args[@]}"; do
           
           # 绑定到选中的 GPU，从指定 point_cloud.ply 启动剪枝微调任务，并将日志写入 logs_prune 目录
           CUDA_VISIBLE_DEVICES=$gpu_id python prune_finetune.py \
-            -s "PATH/TO/DATASET/$arg" \
-            -m "OUTPUT/PATH/${arg}_${prune_percent}" \
+            -s "/root/datasets/360_v2/$arg" \
+            -m "/root/LightGaussian/output/prune/${arg}_${prune_percent}" \
             --eval \
             --port $port \
-            --start_pointcloud "PATH/TO/CHECKPOINT/$arg/point_cloud/iteration_30000/point_cloud.ply" \
+            --start_pointcloud "/root/models/$arg/point_cloud/iteration_30000/point_cloud.ply" \
             --iteration 5000 \
             --test_iterations 5000 \
             --save_iterations 5000 \

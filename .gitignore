@@ -9,3 +9,4 @@ screenshots
 logs_train
 vectree/pruned_distilled
 vectree/output
+*.log

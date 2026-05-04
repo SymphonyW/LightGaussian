@@ -70,11 +70,11 @@ for arg in "${run_args[@]}"; do
           
           # 绑定到选中的 GPU，后台启动剪枝微调任务，并将日志写入 logs_prune 目录
           CUDA_VISIBLE_DEVICES=$gpu_id nohup python prune_finetune.py \
-            -s "PATH/TO/DATASET/$arg" \
-            -m "OUTPUT/PATH/${arg}_${prune_percent}" \
+            -s "/root/datasets/360_v2/$arg" \
+            -m "/root/LightGaussian/output/prune/${arg}_${prune_percent}" \
             --eval \
             --port $port \
-            --start_checkpoint "PATH/TO/CHECKPOINT/$arg/chkpnt30000.pth" \
+            --start_checkpoint "/root/models/$arg/point_cloud/iteration_30000/point_cloud.ply" \
             --iteration 35000 \
             --prune_percent $prune_percent \
             --prune_type $prune_type \
