@@ -13,15 +13,15 @@ port=6025
 
 # 需要蒸馏微调的数据集名称列表
 declare -a run_args=(
-    "bicycle"
-    "bonsai"
-    "counter"
+    # "bicycle"
+    # "bonsai"
+    # "counter"
     "kitchen"
-    "room"
-    "stump"
-    "garden"
-     "train"
-    "truck"
+    # "room"
+    # "stump"
+    # "garden"
+    # "train"
+    # "truck"
 )
 
 
@@ -41,17 +41,17 @@ for arg in "${run_args[@]}"; do
 
         # 绑定到选中的 GPU，后台启动蒸馏微调任务，并将日志写入 logs 目录
         CUDA_VISIBLE_DEVICES=$gpu_id nohup python distill_train.py \
-          -s "PATH/TO/DATASET/$arg" \
-          -m "OUTPUT/PATH/${arg}_${prune_percent}" \
-          --start_checkpoint "PATH/TO/CHECKPOINT/$arg/chkpnt30000.pth" \
+            -s "/root/datasets/360_v2/$arg" \
+            -m "/root/LightGaussian/output/distill/${arg}_${prune_percent}" \
+          --start_checkpoint "/root/models/$arg/point_cloud/iteration_30000/point_cloud.ply" \
           --iteration 40000 \
           --eval \
-          --teacher_model "PATH/TO/TEACHER_CHECKPOINT/${arg}/chkpnt30000.pth" \
+          --teacher_model "/root/models/kitchen/point_cloud/iteration_30000/point_cloud.ply" \
           --new_max_sh 2 \
           --position_lr_max_steps 40000 \
           --enable_covariance \
           $view \
-          --port $port > "logs/distill_${arg}${view}.log" 2>&1 &
+          --port $port > "logs_distill/${arg}${view}.log" 2>&1 &
 
         # 为下一个任务递增端口号
         ((port++))

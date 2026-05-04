@@ -14,10 +14,10 @@ port=6045
 # 该脚本演示从已有 point_cloud.ply 初始化，再进行剪枝微调
 # 需要处理的数据集名称列表；取消注释或新增条目即可批量运行多个数据集
 declare -a run_args=(
-    "bicycle"
+    # "bicycle"
     # "bonsai"
     # "counter"
-    # "kitchen"
+    "kitchen"
     # "room"
     # "stump"
     # "garden"
